@@ -5,6 +5,7 @@ const path = require("node:path");
 
 let loginWindow;
 let mainWindow;
+let loginSuccessHandled = false;
 
 const mainURL =
   process.env.NODE_ENV === "development"
@@ -21,7 +22,46 @@ function generateTK(str) {
   }
   return hash & 0x7fffffff;
 }
+
+function handleLoginSuccess() {
+  if (loginSuccessHandled) return;
+  if (!loginWindow || loginWindow.isDestroyed()) return;
+  loginSuccessHandled = true;
+
+  loginWindow.webContents.session.cookies
+    .get({ url: "https://user.qzone.qq.com" })
+    .then((cookies) => {
+      setCookies(
+        cookies
+          .map((cookie) => {
+            if (cookie.name == "p_skey") {
+              setTk(generateTK(cookie.value));
+            }
+            if (cookie.name == "p_uin") {
+              setQQ(cookie.value.match(/[1-9][0-9]*/g));
+            }
+            return `${cookie.name}=${cookie.value}`;
+          })
+          .join("; ")
+      );
+
+      dialog
+        .showMessageBox(loginWindow, {
+          type: "info",
+          title: "信息",
+          message: "登陆成功！",
+          buttons: ["OK"],
+        })
+        .then(() => {
+          if (!loginWindow || loginWindow.isDestroyed()) return;
+          createMainWindow();
+          loginWindow.destroy();
+        });
+    });
+}
+
 function createMainWindow() {
+  if (mainWindow && !mainWindow.isDestroyed()) return;
   mainWindow = new BrowserWindow({
     height: 600,
     useContentSize: true,
@@ -57,44 +97,54 @@ function createWindow() {
     },
   });
 
+  // 根因修复：通过会话 Cookie 变更判定登录成功，避免依赖中转页 URL 加载
+  const cookieState = {};
+  const onCookieChanged = (_event, cookie) => {
+    if (cookie.name === "p_skey") cookieState.p_skey = cookie.value;
+    if (cookie.name === "p_uin") cookieState.p_uin = cookie.value;
+    if (cookieState.p_skey && cookieState.p_uin) {
+      handleLoginSuccess();
+    }
+  };
+  loginWindow.webContents.session.cookies.on("changed", onCookieChanged);
+
+  // 拦截中转页跳转，避免 ERR_ADDRESS_INVALID 引起的空白渲染
+  loginWindow.webContents.on("will-navigate", (event, url) => {
+    if (url.includes("qzs.qq.com/qzone/v5/loginsucc.html")) {
+      event.preventDefault();
+    }
+  });
+
+  // 加载失败时输出明确日志，避免静默失败
+  loginWindow.webContents.on(
+    "did-fail-load",
+    (_event, errorCode, errorDescription, validatedURL) => {
+      console.warn(
+        `[login] failed to load ${validatedURL}: ${errorCode} ${errorDescription}`
+      );
+    }
+  );
+
   loginWindow.loadURL(QQURL);
+
+  // 兜底：保留 URL 判定逻辑，应对 Cookie 事件未触发的极端情况
   loginWindow.webContents.on("dom-ready", () => {
+    if (loginSuccessHandled) return;
     const currentURL = loginWindow.webContents.getURL();
     if (currentURL.indexOf(`https://user.qzone.qq.com/`) !== -1) {
-      loginWindow.webContents.session.cookies
-        .get({ url: currentURL })
-        .then((cookies) => {
-          setCookies(
-            cookies
-              .map((cookie) => {
-                if (cookie.name == "p_skey") {
-                  setTk(generateTK(cookie.value));
-                }
-                if (cookie.name == "p_uin") {
-                  setQQ(cookie.value.match(/[1-9][0-9]*/g));
-                }
-                return `${cookie.name}=${cookie.value}`;
-              })
-              .join("; ")
-          );
-
-          dialog
-            .showMessageBox(loginWindow, {
-              type: "info",
-              title: "信息",
-              message: "登陆成功！",
-              buttons: ["OK"],
-            })
-            .then(() => {
-              createMainWindow();
-              loginWindow.destroy();
-            });
-        });
+      handleLoginSuccess();
     }
   });
 
   loginWindow.on("closed", function () {
+    if (loginWindow && !loginWindow.isDestroyed()) {
+      loginWindow.webContents.session.cookies.removeListener(
+        "changed",
+        onCookieChanged
+      );
+    }
     loginWindow = null;
+    loginSuccessHandled = false;
   });
 }
 
